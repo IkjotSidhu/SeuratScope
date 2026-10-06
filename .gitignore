@@ -1,0 +1,51 @@
+# ── R session files ──────────────────────────────────────────
+.Rhistory
+.Rapp.history
+.RData
+.Rproj.user/
+*.Rproj
+.Rprofile
+.Renviron
+
+# ── Data files ───────────────────────────────────────────────
+# Seurat objects are far too large for git (often 1–25 GB).
+# Users supply their own via the app's Browse button.
+*.rds
+*.RDS
+*.h5
+*.h5ad
+*.loom
+*.mtx
+*.tar.gz
+data/
+rds-objects/
+
+# ── Plot outputs ─────────────────────────────────────────────
+*.pdf
+*.png
+*.jpg
+*.jpeg
+*.tiff
+*.svg
+!docs/screenshots/*.png
+!docs/cover.png
+!docs/cover.svg
+!docs/screenshots/*.jpg
+output/
+plots/
+
+# ── renv (if used) ───────────────────────────────────────────
+renv/library/
+renv/local/
+renv/staging/
+
+# ── OS files ─────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+._*
+
+# ── Editor ───────────────────────────────────────────────────
+.vscode/
+.idea/
+*~
+*.swp
