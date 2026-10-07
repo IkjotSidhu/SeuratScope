@@ -18,7 +18,7 @@ Load a Seurat `.RDS` file and explore it through QC, UMAP embeddings, gene expre
 |---|---|
 | **QC** | `nCount` / `nFeature` / `percent.mt` (plus TSS enrichment and nucleosome signal for ATAC) violins and feature scatter — auto-detected from metadata. |
 | **UMAP / Reduction** | `DimPlot` and `FeaturePlot` on any reduction — clusters, genes, module scores, or 2-gene co-expression. |
-| **Feature Expression** | Violin, box, dot, and heatmap plots for genes and/or module scores, grouped by any metadata column, with optional statistics. |
+| **Feature Expression** | Violin, box, dot, and heatmap plots for genes and/or module scores, grouped by any metadata column, with optional statistics. Choose the **assay** and the **expression values** to plot — raw counts, log-normalized, SCT-corrected, or scaled. |
 | **Spatial** | Clusters, gene expression, or module/UCell scores over tissue images *(shown only when the object has images)*. |
 | **Composition** | Stacked/grouped bar charts of cell-type or cluster makeup per sample. |
 | **Metadata** | Bar charts, histograms, density plots, and a searchable data table. |
@@ -130,7 +130,15 @@ Then:
 
 ## A note on expression values
 
-Gene expression plots read the **`data` layer** (log-normalized counts) of whichever assay is set as **Active Assay** — the same values Seurat's own `FeaturePlot` / `VlnPlot` use. The app does **not** normalize anything itself; it displays what's in the object. If your object was processed with `NormalizeData()` (or SCTransform), those are the log-normalized values.
+On the **Feature Expression** tab you choose both the **Assay** and the **Expression values** (the layer) to plot. What each option means depends on the assay:
+
+| Layer | RNA | SCT | ATAC peaks |
+|---|---|---|---|
+| `counts` | Raw counts | SCT-corrected counts | Raw peak counts |
+| `data` *(default)* | Log-normalized | SCT log-normalized | Normalized (e.g. TF-IDF) |
+| `scale.data` | Scaled (z-score) | SCT Pearson residuals | Scaled |
+
+Only the layers an assay actually has are offered. Scaled layers usually hold **only the variable features**, so genes outside that set are reported as missing rather than silently dropped. Dot plots need counts or normalized values; heatmaps always show z-scored values (raw counts are log-normalized on a copy first). The app never modifies your object — it displays what's stored in it. The UMAP and Spatial tabs use the sidebar's **Active Assay** and its `data` layer.
 
 ---
 

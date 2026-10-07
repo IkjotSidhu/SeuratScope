@@ -183,8 +183,117 @@ get_theme_obj <- function(theme_name, base_size = 12) {
 }
 
 # Add a ggplot2 theme to a single plot.
+#
+# A *complete* theme (theme_classic(), theme_prism(), ...) replaces every
+# theme setting made before it, so tweaks added earlier in a plot's build
+# (rotated axis labels, hidden legends) were silently discarded. We therefore
+# save the plot's incomplete tweaks, apply the complete theme, then re-apply
+# the tweaks on top. Plots that already carry a complete theme (Seurat's
+# DimPlot/FeaturePlot) are left as before: the new theme simply replaces it.
 apply_theme <- function(p, theme_name, base_size = 12) {
-  p + get_theme_obj(theme_name, base_size)
+  prior <- p$theme
+  p <- p + get_theme_obj(theme_name, base_size)
+  if (length(prior) > 0 && !isTRUE(attr(prior, "complete"))) p <- p + prior
+  p
+}
+
+# ── X-axis label rotation ─────────────────────────────────────
+# "auto" turns labels vertical when there are many groups or long names,
+# which is when 45° labels start to collide.
+X_ANGLE_CHOICES <- c("Auto" = "auto", "45°" = "45", "90° (vertical)" = "90",
+                     "0° (horizontal)" = "0")
+
+x_label_angle <- function(choice, labels) {
+  labels <- as.character(labels)
+  n  <- length(labels)
+  mx <- if (n > 0) max(nchar(labels), na.rm = TRUE) else 0
+  if (is.null(choice) || identical(choice, "auto")) {
+    if (n > 12 || mx > 10) 90 else 45
+  } else as.numeric(choice)
+}
+
+x_label_theme <- function(choice, labels) {
+  ang <- x_label_angle(choice, labels)
+  if (ang >= 80)      theme(axis.text.x = element_text(angle = 90, hjust = 1,   vjust = 0.5))
+  else if (ang <= 10) theme(axis.text.x = element_text(angle = 0,  hjust = 0.5, vjust = 1))
+  else                theme(axis.text.x = element_text(angle = 45, hjust = 1,   vjust = 1))
+}
+
+# ── Assay layers (raw / log-normalized / scaled / SCT) ────────
+# Which of counts / data / scale.data an assay has, with labels that say what
+# the numbers actually are for that kind of assay.
+LAYER_ORDER <- c("counts", "data", "scale.data")
+
+assay_layer_names <- function(o, assay) {
+  lyr <- tryCatch(Layers(o[[assay]]), error = function(e) character(0))
+  keep <- vapply(LAYER_ORDER, function(l)
+    any(lyr == l | startsWith(lyr, paste0(l, "."))), logical(1))
+  LAYER_ORDER[keep]
+}
+
+assay_kind <- function(o, assay) {
+  if (inherits(o[[assay]], "ChromatinAssay"))   "atac"
+  else if (class(o[[assay]])[1] == "SCTAssay")  "sct"
+  else                                          "rna"
+}
+
+layer_label <- function(o, assay, layer) {
+  kind <- assay_kind(o, assay)
+  switch(paste(kind, layer, sep = "|"),
+    "rna|counts"        = "Raw counts",
+    "rna|data"          = "Log-normalized",
+    "rna|scale.data"    = "Scaled (z-score)",
+    "sct|counts"        = "SCT corrected counts",
+    "sct|data"          = "SCT log-normalized",
+    "sct|scale.data"    = "SCT Pearson residuals (scaled)",
+    "atac|counts"       = "Raw peak counts",
+    "atac|data"         = "Normalized (e.g. TF-IDF)",
+    "atac|scale.data"   = "Scaled",
+    layer)
+}
+
+layer_choices <- function(o, assay) {
+  ln <- assay_layer_names(o, assay)
+  setNames(ln, vapply(ln, function(l) layer_label(o, assay, l), character(1)))
+}
+
+default_layer <- function(o, assay) {
+  ln <- assay_layer_names(o, assay)
+  if ("data" %in% ln) "data" else if (length(ln) > 0) ln[1] else "data"
+}
+
+# Normalized "data" layers are log1p-scaled; averaging for dot plots should be
+# done on the natural scale (as Seurat::DotPlot does), counts are used as-is.
+expm1_if_log <- function(x, layer) if (identical(layer, "data")) expm1(x) else x
+
+# Y-axis title that states what is being plotted
+layer_ylab <- function(o, assay, layer) {
+  switch(layer,
+    counts     = layer_label(o, assay, "counts"),
+    data       = paste(layer_label(o, assay, "data"), "expression"),
+    scale.data = if (assay_kind(o, assay) == "sct") "SCT Pearson residuals"
+                 else "Scaled expression (z-score)",
+    "Expression")
+}
+
+# genes (rows) x cells matrix for one assay layer. Handles split layers
+# (counts.1, counts.2, ...) by joining them. For scale.data only the scaled
+# (variable) features exist, so the caller is told which requested features
+# were missing via the "missing" attribute.
+get_layer_matrix <- function(o, assay, layer, features) {
+  a    <- o[[assay]]
+  lyr  <- Layers(a)
+  hits <- lyr[lyr == layer | startsWith(lyr, paste0(layer, "."))]
+  if (length(hits) == 0)
+    stop(sprintf("Assay '%s' has no '%s' layer.", assay, layer))
+  mats <- lapply(hits, function(l) LayerData(a, layer = l))
+  rows <- Reduce(intersect, lapply(mats, rownames))
+  feats <- intersect(features, rows)
+  m <- do.call(cbind, lapply(mats, function(x) as.matrix(x[feats, , drop = FALSE])))
+  m <- m[, match(colnames(o), colnames(m)), drop = FALSE]
+  colnames(m) <- colnames(o)
+  attr(m, "missing") <- setdiff(features, feats)
+  m
 }
 
 # Numeric metadata columns — i.e. module scores (AddModuleScore), UCell scores,
@@ -327,8 +436,15 @@ score_centered_color <- function(values, scale_name) {
 }
 
 error_plot <- function(msg) {
+  # Wrap long messages so they aren't clipped at the plot edges; explicit
+  # newlines in the message are preserved.
+  wrapped <- paste(
+    vapply(strsplit(msg, "\n", fixed = TRUE)[[1]],
+           function(l) if (nzchar(l)) paste(strwrap(l, width = 42), collapse = "\n") else "",
+           character(1)),
+    collapse = "\n")
   ggplot() +
-    annotate("text", x = 0.5, y = 0.5, label = msg, size = 5, color = "firebrick") +
+    annotate("text", x = 0.5, y = 0.5, label = wrapped, size = 4.5, color = "firebrick") +
     theme_void()
 }
 
@@ -707,6 +823,17 @@ ui <- page_sidebar(
       layout_sidebar(
         sidebar = sidebar(
           open = TRUE,
+          # Data source: which assay, and which layer of it (raw counts,
+          # log-normalized, SCT, scaled...). Defaults follow the sidebar's
+          # Active Assay but can be changed here independently.
+          selectInput("fe_assay", "Assay", choices = NULL),
+          selectInput("fe_layer", "Expression values", choices = NULL),
+          conditionalPanel("input.fe_type == 'heatmap'",
+            helpText(tags$small("Heatmaps always show z-scored values; raw counts are log-normalized first."))
+          ),
+          conditionalPanel("input.fe_type == 'dot'",
+            helpText(tags$small("Dot plots need counts or normalized values (not scaled)."))
+          ),
           selectizeInput("fe_genes", "Genes / Scores (one or more)",
                          choices  = NULL,
                          multiple = TRUE,
@@ -750,6 +877,8 @@ ui <- page_sidebar(
           ),
 
           theme_picker_ui("fe_theme"),
+          selectInput("fe_xangle", "X-axis label angle",
+                      choices = X_ANGLE_CHOICES, selected = "auto"),
           hr(),
           h6("Save Plot"),
           fluidRow(
@@ -1107,6 +1236,10 @@ server <- function(input, output, session) {
       list("Genes" = as.list(features))
     }
     updateSelectizeInput(session, "fe_genes", choices = fe_choices, server = TRUE)
+    # Data source for the expression plots: assay + layer
+    updateSelectInput(session, "fe_assay", choices = assay_choices(o), selected = def_assay)
+    updateSelectInput(session, "fe_layer", choices = layer_choices(o, def_assay),
+                      selected = default_layer(o, def_assay))
     updateSelectInput(session, "fe_group",    choices = meta_cols, selected = def_clust)
     updateSelectInput(session, "fe_split",    choices = c("None" = "none", cat_meta),
                       selected = "none")
@@ -1137,10 +1270,33 @@ server <- function(input, output, session) {
     updateSelectizeInput(session, "dr_gene",  choices = feats, server = TRUE)
     updateSelectizeInput(session, "dr_gene1", choices = feats, server = TRUE)
     updateSelectizeInput(session, "dr_gene2", choices = feats, server = TRUE)
-    fe_choices <- if (length(scores) > 0)
-      list("Module / UCell scores" = as.list(scores), "Features" = as.list(feats))
-    else list("Features" = as.list(feats))
-    updateSelectizeInput(session, "fe_genes", choices = fe_choices, server = TRUE)
+    # The Feature Expression tab follows the global assay by default; its own
+    # observer (below) then refreshes that tab's layers and gene list.
+    updateSelectInput(session, "fe_assay", selected = input$active_assay)
+  }, ignoreInit = TRUE)
+
+  # Feature Expression: the tab's own assay choice. Refreshes which layers are
+  # offered and the searchable gene/peak list, keeping any selected genes that
+  # also exist in the new assay.
+  observeEvent(input$fe_assay, {
+    o <- rv$obj
+    req(o, input$fe_assay, input$fe_assay %in% Assays(o))
+    a <- input$fe_assay
+
+    cur_layer <- isolate(input$fe_layer)
+    lc <- layer_choices(o, a)
+    updateSelectInput(session, "fe_layer", choices = lc,
+                      selected = if (!is.null(cur_layer) && cur_layer %in% lc) cur_layer
+                                 else default_layer(o, a))
+
+    feats  <- assay_features(o, a)
+    scores <- get_numeric_meta(o)
+    kind   <- if (is_chromatin(o, a)) "Peaks" else "Genes"
+    ch <- if (length(scores) > 0)
+      setNames(list(as.list(scores), as.list(feats)), c("Module / UCell scores", kind))
+    else setNames(list(as.list(feats)), kind)
+    keep <- intersect(isolate(input$fe_genes), c(feats, scores))
+    updateSelectizeInput(session, "fe_genes", choices = ch, selected = keep, server = TRUE)
   }, ignoreInit = TRUE)
 
   # Keep reference-group + reorder choices in sync with the Group By selector
@@ -1507,6 +1663,11 @@ server <- function(input, output, session) {
     grp   <- input$fe_group
     split <- if (!is.null(input$fe_split) && input$fe_split != "none") input$fe_split else NULL
 
+    # Data source chosen on this tab: which assay and which layer of it
+    assay <- input$fe_assay
+    layer <- input$fe_layer
+    req(assay, layer, assay %in% Assays(o))
+
     tryCatch({
       # Pre-sort group factor (custom order if the user set one)
       custom <- if (isTRUE(input$fe_order_on)) input$fe_order else NULL
@@ -1518,24 +1679,47 @@ server <- function(input, output, session) {
       facet <- if (is.null(split)) facet_wrap(~gene, scales = "free_y")
                else facet_grid(gene ~ .split, scales = "free_y")
 
-      # Y-axis label depends on what was selected: genes are expression,
-      # metadata columns are scores.
+      # Y-axis label says what is plotted: the chosen layer for genes, or
+      # "Score" for module/UCell scores (which live in meta.data, not an assay).
       score_cols <- get_numeric_meta(o)
-      n_scores   <- sum(genes %in% score_cols)
+      gene_lab   <- layer_ylab(o, assay, layer)
+      n_scores   <- sum(genes %in% score_cols & !genes %in% rownames(o[[assay]]))
       y_lab <- if (n_scores == length(genes)) "Score"
-               else if (n_scores > 0)         "Expression / Score"
-               else                           "Expression"
+               else if (n_scores > 0)         paste(gene_lab, "/ Score")
+               else                           gene_lab
 
-      # ── Helper: extract a long data frame for violin / box ──
-      # FetchData resolves genes AND numeric metadata (module/UCell scores)
-      # in one call; GetAssayData would only see genes.
+      # ── Helper: cells x features data frame for the chosen assay layer ──
+      # Genes/peaks come from the selected layer; module/UCell scores come
+      # from meta.data (they don't depend on the layer).
+      get_expr_values <- function() {
+        gene_req  <- genes[genes %in% rownames(o[[assay]])]
+        score_req <- setdiff(genes[genes %in% colnames(o@meta.data)], gene_req)
+        if (length(gene_req) + length(score_req) == 0)
+          stop(sprintf("None of the selected genes or scores were found in assay '%s'.", assay))
+
+        vals <- data.frame(row.names = colnames(o))
+        if (length(gene_req) > 0) {
+          m <- get_layer_matrix(o, assay, layer, gene_req)
+          miss <- attr(m, "missing")
+          if (length(miss) > 0)
+            showNotification(
+              sprintf("%d of %d selected feature(s) aren't in the '%s' layer (scaled layers only hold variable features): %s",
+                      length(miss), length(gene_req), layer_label(o, assay, layer),
+                      paste(head(miss, 6), collapse = ", ")),
+              type = "warning", duration = 8)
+          if (nrow(m) > 0) vals <- cbind(vals, as.data.frame(t(m), check.names = FALSE))
+        }
+        for (s in score_req) vals[[s]] <- o@meta.data[[s]]
+
+        if (ncol(vals) == 0)
+          stop(sprintf("None of the selected features are in the '%s' layer of '%s'. Try 'Log-normalized' or another layer.",
+                       layer_label(o, assay, layer), assay))
+        vals[, genes[genes %in% colnames(vals)], drop = FALSE]   # keep the user's order
+      }
+
+      # Long format used by violin / box / dot plots
       get_expr_long <- function() {
-        ok <- genes[genes %in% rownames(o) | genes %in% colnames(o@meta.data)]
-        if (length(ok) == 0)
-          stop("None of the requested genes or scores were found.")
-
-        vals <- FetchData(o, vars = ok)
-        # FetchData may rename non-syntactic names; realign to what it returned
+        vals <- get_expr_values()
         ok   <- colnames(vals)
 
         df <- data.frame(
@@ -1562,8 +1746,7 @@ server <- function(input, output, session) {
                        outlier.size = 0.5, outlier.alpha = 0.4) +
           scale_fill_manual(values = cols) +
           facet +
-          theme(axis.text.x = element_text(angle = 45, hjust = 1),
-                legend.position = "none") +
+          theme(legend.position = "none") +
           labs(x = grp, y = y_lab)
 
         if (isTRUE(input$fe_show_stats) && is.null(split)) {
@@ -1577,14 +1760,36 @@ server <- function(input, output, session) {
                                 inherit.aes  = FALSE)
         }
 
-        apply_theme(p, input$fe_theme, input$base_size)
+        apply_theme(p, input$fe_theme, input$base_size) +
+          x_label_theme(input$fe_xangle, lvls)
 
       } else if (input$fe_type == "dot") {
-        p <- DotPlot(o, features = genes, group.by = grp) +
-          scale_color_viridis_c() +
-          theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
-          coord_flip()
-        apply_theme(p, input$fe_theme, input$base_size)
+        # Dot size = % of cells expressing; colour = average expression scaled
+        # across groups. Built here (rather than Seurat::DotPlot, which assumes
+        # log-normalized data) so it works for any counts/normalized layer.
+        if (layer == "scale.data")
+          stop("Dot plots need counts or normalized values. Choose 'Raw counts' or a normalized layer.")
+        df_long <- get_expr_long()
+
+        dd <- df_long %>%
+          group_by(gene, group) %>%
+          summarise(avg = mean(expm1_if_log(expr, layer), na.rm = TRUE),
+                    pct = 100 * mean(expr > 0, na.rm = TRUE), .groups = "drop") %>%
+          group_by(gene) %>%
+          mutate(avg_scaled = {
+            la <- log1p(avg); s <- stats::sd(la)
+            if (is.na(s) || s == 0) 0 else pmax(pmin((la - mean(la)) / s, 2.5), -2.5)
+          }) %>%
+          ungroup()
+        dd$gene <- factor(dd$gene, levels = rev(levels(df_long$gene)))   # first gene on top
+
+        p <- ggplot(dd, aes(x = group, y = gene, size = pct, color = avg_scaled)) +
+          geom_point() +
+          scale_color_viridis_c(name = "Avg expression\n(scaled)") +
+          scale_size(range = c(0, 6), limits = c(0, 100), name = "% expressing") +
+          labs(x = grp, y = NULL)
+        apply_theme(p, input$fe_theme, input$base_size) +
+          x_label_theme(input$fe_xangle, lvls)
 
       } else if (input$fe_type == "box") {
         df_long <- get_expr_long()
@@ -1593,8 +1798,7 @@ server <- function(input, output, session) {
           geom_boxplot(outlier.size = 0.2, outlier.alpha = 0.3) +
           scale_fill_manual(values = cols) +
           facet +
-          theme(axis.text.x = element_text(angle = 45, hjust = 1),
-                legend.position = "none") +
+          theme(legend.position = "none") +
           labs(x = grp, y = y_lab)
 
         if (isTRUE(input$fe_show_stats) && is.null(split)) {
@@ -1608,14 +1812,16 @@ server <- function(input, output, session) {
                                 inherit.aes  = FALSE)
         }
 
-        apply_theme(p, input$fe_theme, input$base_size)
+        apply_theme(p, input$fe_theme, input$base_size) +
+          x_label_theme(input$fe_xangle, lvls)
 
       } else if (input$fe_type == "heatmap") {
-        gene_ok <- genes[genes %in% rownames(o)]
+        gene_ok <- genes[genes %in% rownames(o[[assay]])]
         if (length(gene_ok) < 1)
-          stop("Heatmap needs genes from the assay (module/UCell scores aren't supported here).")
+          stop("Heatmap needs genes from the selected assay (module/UCell scores aren't supported here).")
 
         oh <- o
+        DefaultAssay(oh) <- assay
         oh@meta.data[[grp]] <- factor(oh@meta.data[[grp]], levels = lvls)
         Idents(oh) <- grp
         # Downsample very large objects so the heatmap stays legible and fast
@@ -1623,22 +1829,44 @@ server <- function(input, output, session) {
           set.seed(1)
           oh <- subset(oh, cells = sample(colnames(oh), 8000))
         }
-        # DoHeatmap needs scaled data; scaling needs a normalized 'data' layer.
-        # If the object only has raw counts, normalize this local copy so the
-        # heatmap still works (the loaded object itself is never modified).
-        if (!"data" %in% SeuratObject::Layers(oh)) {
-          showNotification("Assay has no normalized layer — normalizing on the fly for the heatmap.",
-                           type = "message", duration = 4)
-          oh <- NormalizeData(oh, verbose = FALSE)
+
+        # Heatmaps plot z-scored values. If the chosen layer is already scaled
+        # (e.g. SCT Pearson residuals) and holds the genes, use it as-is;
+        # otherwise scale from normalized data, log-normalizing a local copy
+        # first when the layer is raw counts or no normalized layer exists.
+        # The loaded object itself is never modified.
+        use_existing <- FALSE
+        if (layer == "scale.data") {
+          have <- tryCatch(rownames(LayerData(oh[[assay]], layer = "scale.data")),
+                           error = function(e) character(0))
+          if (any(gene_ok %in% have)) {
+            gene_ok <- gene_ok[gene_ok %in% have]; use_existing <- TRUE
+          }
         }
-        oh <- ScaleData(oh, features = gene_ok, verbose = FALSE)
+        if (!use_existing) {
+          if (layer == "counts" || !"data" %in% Layers(oh[[assay]])) {
+            showNotification("Log-normalizing a copy of the counts for the heatmap.",
+                             type = "message", duration = 4)
+            oh <- NormalizeData(oh, assay = assay, verbose = FALSE)
+          }
+          oh <- ScaleData(oh, assay = assay, features = gene_ok, verbose = FALSE)
+        }
+        hm_angle <- x_label_angle(input$fe_xangle, lvls)
         p <- suppressMessages(suppressWarnings(
-          DoHeatmap(oh, features = gene_ok, group.by = grp,
-                    group.colors = unname(cols[lvls]), size = 3.6) +
+          DoHeatmap(oh, features = gene_ok, group.by = grp, assay = assay,
+                    group.colors = unname(cols[lvls]), size = 3.6,
+                    angle = hm_angle) +
             scale_fill_gradient2(low = "#2166AC", mid = "white", high = "#B2182B",
-                                 midpoint = 0, na.value = "white")
+                                 midpoint = 0, na.value = "white") +
+            # The group names are already printed above the colour bars, so the
+            # "Identity" legend only repeats them and squeezes the heatmap.
+            guides(colour = "none")
         ))
-        p
+        # DoHeatmap draws its group labels above the panel (clip = "off"), so
+        # long labels need headroom or they are cut off at the top of the image.
+        # ~3.6 pt per character, scaled by how vertical the labels are.
+        top_pt <- max(nchar(lvls)) * 3.6 * sin(hm_angle * pi / 180) + 8
+        p + theme(plot.margin = margin(t = top_pt, r = 10, b = 5, l = 5, unit = "pt"))
       }
 
     }, error = function(e) error_plot(conditionMessage(e)))
