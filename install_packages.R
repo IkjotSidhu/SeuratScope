@@ -61,6 +61,27 @@ for (p in cran_packages) {
   }
 }
 
+# ── Optional: Signac (10x Multiome / scATAC support) ─────────
+# Signac lives on Bioconductor and pulls in heavy dependencies, so it's
+# optional: without it SeuratScope still runs and the Coverage tab simply
+# explains that Signac is needed. Install failures here never block the app.
+message("\nOptional: Signac (for multiome / ATAC coverage tracks)...")
+if (requireNamespace("Signac", quietly = TRUE)) {
+  message(sprintf("  [ok]   %-14s %s", "Signac", as.character(packageVersion("Signac"))))
+} else {
+  message("  Not installed — attempting install via Bioconductor (this can take a few minutes)...")
+  tryCatch({
+    if (!requireNamespace("BiocManager", quietly = TRUE))
+      install.packages("BiocManager", repos = repo)
+    BiocManager::install("Signac", update = FALSE, ask = FALSE)
+    message("  [ok]   Signac installed")
+  }, error = function(e) {
+    message("  [skip] Signac could not be installed (", conditionMessage(e), ").\n",
+            "         Multiome coverage tracks will be unavailable; everything else works.\n",
+            "         Retry later with: BiocManager::install(\"Signac\")")
+  })
+}
+
 if (length(failed) > 0) {
   message("\nThe following packages failed to install:\n  ",
           paste(failed, collapse = ", "),

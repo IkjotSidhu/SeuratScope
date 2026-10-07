@@ -15,6 +15,11 @@ library(rstatix)
 library(shinycssloaders)
 library(shinyFiles)
 
+# Signac powers ATAC / multiome coverage tracks. It's optional — the app runs
+# without it, and the Coverage tab shows a message if it's not installed.
+HAS_SIGNAC <- requireNamespace("Signac", quietly = TRUE)
+if (HAS_SIGNAC) suppressPackageStartupMessages(library(Signac))
+
 # Wrap a plot output with a loading spinner — used on every plot so the user
 # always sees that something is happening while a plot recomputes.
 spin <- function(output) {
@@ -203,6 +208,40 @@ get_cat_meta <- function(o, max_levels = 30) {
   }, logical(1))
   names(meta)[keep]
 }
+
+# ── Multiome / multi-modal assay helpers ──────────────────────
+# Is an assay a Signac ChromatinAssay (ATAC)?
+is_chromatin <- function(o, assay) inherits(o[[assay]], "ChromatinAssay")
+
+# A human label for each assay, tagging its modality so users know what
+# they're plotting (gene expression vs ATAC peaks vs other).
+assay_choices <- function(o) {
+  labs <- vapply(Assays(o), function(a) {
+    cls <- class(o[[a]])[1]
+    tag <- if (is_chromatin(o, a))            "ATAC / peaks"
+           else if (cls == "SCTAssay")        "gene expr (SCT)"
+           else if (grepl("^RNA$", a))        "gene expr"
+           else if (grepl("activity", a, ignore.case = TRUE)) "gene activity"
+           else if (grepl("chromvar", a, ignore.case = TRUE)) "motif activity"
+           else                               "gene expr"
+    sprintf("%s — %s", a, tag)
+  }, character(1))
+  setNames(Assays(o), labs)
+}
+
+# Prefer a gene-expression assay for the initial Active Assay, so users land
+# on genes rather than hundreds of thousands of ATAC peaks.
+default_expr_assay <- function(o) {
+  assays <- Assays(o)
+  gene_assays <- assays[!vapply(assays, function(a) is_chromatin(o, a), logical(1))]
+  if ("SCT" %in% gene_assays) "SCT"
+  else if ("RNA" %in% gene_assays) "RNA"
+  else if (length(gene_assays) > 0) gene_assays[1]
+  else DefaultAssay(o)
+}
+
+# Features of a given assay (genes for RNA/SCT, peaks for ATAC)
+assay_features <- function(o, assay) rownames(o[[assay]])
 
 # Sequential scales are for expression/UCell (bounded, all-positive).
 # Diverging scales are centred at zero for AddModuleScore output, which is
@@ -574,6 +613,33 @@ ui <- page_sidebar(
       )
     ),
 
+    # ── COVERAGE (ATAC / multiome) ───────────────────────────
+    nav_panel(
+      title = tagList(icon("chart-area"), "Coverage"), value = "coverage",
+
+      layout_sidebar(
+        sidebar = sidebar(
+          open = TRUE,
+          selectInput("cv_assay", "ATAC assay", choices = NULL),
+          textInput("cv_gene", "Gene or region",
+                    placeholder = "e.g. Cd4  or  chr1-100-200"),
+          selectInput("cv_group", "Group By", choices = NULL),
+          numericInput("cv_up",   "Extend upstream (bp)",   2000, 0, 1e6, 500),
+          numericInput("cv_down", "Extend downstream (bp)", 2000, 0, 1e6, 500),
+          checkboxInput("cv_peaks", "Show peaks track", TRUE),
+          hr(),
+          h6("Save Plot"),
+          fluidRow(
+            column(6, selectInput("cv_fmt", NULL, choices = c("PNG", "PDF"))),
+            column(3, numericInput("cv_w", "W", 10, 2, 30, 1)),
+            column(3, numericInput("cv_h", "H",  7, 2, 30, 1))
+          ),
+          downloadButton("cv_dl", "Save", class = "btn-success w-100")
+        ),
+        spin(plotOutput("cv_plot", height = "620px"))
+      )
+    ),
+
     # ── REDUCTION / UMAP ─────────────────────────────────────
     nav_panel(
       title = tagList(icon("circle-dot"), "UMAP / Reduction"), value = "umap",
@@ -924,12 +990,17 @@ server <- function(input, output, session) {
   adapt_ui <- function(o) {
     has_images <- length(o@images)     > 0
     has_red    <- length(o@reductions) > 0
+    has_atac   <- any(vapply(Assays(o), function(a) is_chromatin(o, a), logical(1)))
 
     if (has_images) nav_show("main_tabs", "spatial")
     else            nav_hide("main_tabs", "spatial")
 
     if (has_red) nav_show("main_tabs", "umap")
     else         nav_hide("main_tabs", "umap")
+
+    # Coverage is ATAC-only (needs a ChromatinAssay)
+    if (has_atac) nav_show("main_tabs", "coverage")
+    else          nav_hide("main_tabs", "coverage")
 
     # Landing tab: spatial for tissue data, else UMAP, else expression
     landing <- if (has_images) "spatial" else if (has_red) "umap" else "feature"
@@ -946,11 +1017,16 @@ server <- function(input, output, session) {
     meta_cols  <- colnames(o@meta.data)
     images     <- names(o@images)
     reductions <- names(o@reductions)
-    features   <- rownames(o)
 
-    def_assay <- DefaultAssay(o)
+    # Default to a gene-expression assay (not ATAC peaks), and list that
+    # assay's features. Switching Active Assay later refreshes these.
+    def_assay <- default_expr_assay(o)
+    DefaultAssay(rv$obj) <- def_assay
+    features  <- assay_features(o, def_assay)
+
     def_clust <- if ("seurat_clusters" %in% meta_cols) "seurat_clusters" else meta_cols[1]
-    def_red   <- if ("umap.sketch" %in% reductions) "umap.sketch"
+    def_red   <- if ("wnn.umap"    %in% reductions) "wnn.umap"
+                 else if ("umap.sketch" %in% reductions) "umap.sketch"
                  else if ("umap"   %in% reductions) "umap"
                  else if (length(reductions) > 0)   reductions[1]
                  else NULL
@@ -961,15 +1037,22 @@ server <- function(input, output, session) {
     def_score <- if (length(scores) > 0) scores[1] else NULL
 
     # QC metrics — numeric columns matching the usual QC names come first
-    qc_pat    <- "^nCount|^nFeature|percent|pct_|mito|ribo|doublet|\\.score"
+    # (RNA + ATAC/multiome: TSS enrichment, nucleosome signal, FRiP, doublets)
+    qc_pat    <- "^nCount|^nFeature|percent|pct_|mito|ribo|doublet|\\.score|TSS|nucleosome|FRiP|blacklist|atac"
     qc_hits   <- scores[grepl(qc_pat, scores, ignore.case = TRUE)]
-    qc_def    <- head(if (length(qc_hits) > 0) qc_hits else scores, 3)
+    # Pick the most informative QC metrics first (RNA depth/complexity, % mito,
+    # then ATAC quality) rather than whatever sorts first alphabetically.
+    qc_priority <- c("nCount_RNA", "nFeature_RNA", "percent.mt", "percent.mito",
+                     "TSS.enrichment", "nucleosome_signal", "nCount_ATAC", "FRiP")
+    qc_pref   <- qc_priority[qc_priority %in% qc_hits]
+    qc_def    <- head(unique(c(qc_pref, qc_hits)), if (length(qc_pref) > 0) length(qc_pref) else 3)
+    qc_def    <- head(qc_def, 5)
     def_x     <- grep("^nCount",   scores, value = TRUE)[1]
     def_y     <- grep("^nFeature", scores, value = TRUE)[1]
     if (is.na(def_x)) def_x <- scores[1]
     if (is.na(def_y)) def_y <- if (length(scores) > 1) scores[2] else scores[1]
 
-    updateSelectInput(session, "active_assay", choices = assays, selected = def_assay)
+    updateSelectInput(session, "active_assay", choices = assay_choices(o), selected = def_assay)
 
     # QC
     updateSelectizeInput(session, "qc_metrics", choices = scores, selected = qc_def,
@@ -979,6 +1062,16 @@ server <- function(input, output, session) {
     updateSelectInput(session, "qc_y",     choices = scores, selected = def_y)
     updateSelectInput(session, "qc_color", choices = c("Identity" = "none", meta_cols),
                       selected = def_clust)
+
+    # Coverage (ATAC) — list ChromatinAssays, group by a categorical column
+    atac_assays <- assays[vapply(assays, function(a) is_chromatin(o, a), logical(1))]
+    updateSelectInput(session, "cv_assay",
+                      choices = if (length(atac_assays) > 0) atac_assays else c("(no ATAC assay)" = ""))
+    # Clusters often exceed the default 30-level cap (e.g. 39 WNN clusters),
+    # and they're the most natural thing to group coverage tracks by.
+    cv_cols <- get_cat_meta(o, max_levels = 80)
+    updateSelectInput(session, "cv_group", choices = cv_cols,
+                      selected = if (def_clust %in% cv_cols) def_clust else cv_cols[1])
 
     # Spatial
     updateSelectInput(session, "sp_color_by", choices = meta_cols, selected = def_clust)
@@ -1035,7 +1128,20 @@ server <- function(input, output, session) {
     o <- rv$obj
     req(o, input$active_assay, input$active_assay %in% Assays(o))
     DefaultAssay(rv$obj) <- input$active_assay
-  })
+
+    # Refresh feature selectors to the new assay's features (genes vs peaks).
+    # Essential for multiome, where switching RNA ↔ ATAC changes the feature set.
+    feats  <- assay_features(o, input$active_assay)
+    scores <- get_numeric_meta(o)
+    updateSelectizeInput(session, "sp_gene",  choices = feats, server = TRUE)
+    updateSelectizeInput(session, "dr_gene",  choices = feats, server = TRUE)
+    updateSelectizeInput(session, "dr_gene1", choices = feats, server = TRUE)
+    updateSelectizeInput(session, "dr_gene2", choices = feats, server = TRUE)
+    fe_choices <- if (length(scores) > 0)
+      list("Module / UCell scores" = as.list(scores), "Features" = as.list(feats))
+    else list("Features" = as.list(feats))
+    updateSelectizeInput(session, "fe_genes", choices = fe_choices, server = TRUE)
+  }, ignoreInit = TRUE)
 
   # Keep reference-group + reorder choices in sync with the Group By selector
   observeEvent(input$fe_group, {
@@ -1098,7 +1204,9 @@ server <- function(input, output, session) {
       style = "background:rgba(24,188,156,0.07);",
       if (is_visium_hd) stat_row("border-all", "Binning", paste(bin_sizes, collapse = ", ")),
       stat_row("table-cells", tools::toTitleCase(spot_label), format(ncol(o), big.mark = ",")),
-      stat_row("dna",         "Genes",   format(nrow(o), big.mark = ",")),
+      stat_row("dna",
+               if (is_chromatin(o, DefaultAssay(o))) "Peaks" else "Genes",
+               format(nrow(o), big.mark = ",")),
       stat_row("layer-group", "Assays",  paste(assays, collapse = ", ")),
       if (has_images)
         stat_row("image", "Images", paste(names(o@images), collapse = ", ")),
@@ -1152,6 +1260,61 @@ server <- function(input, output, session) {
   output$qc_dl   <- downloadHandler(
     filename = function() paste0("qc_plot.", tolower(input$qc_fmt)),
     content  = function(file) save_plot(qc_plot_r(), input$qc_fmt, input$qc_w, input$qc_h, file)
+  )
+
+
+  # ============================================================
+  # COVERAGE TAB (ATAC / multiome)
+  # ============================================================
+  cv_plot_r <- reactive({
+    o <- rv$obj
+    req(o)
+
+    if (!HAS_SIGNAC)
+      return(error_plot("Signac is not installed.\nInstall it to view ATAC coverage tracks:\n  BiocManager::install(\"Signac\")"))
+
+    assay <- input$cv_assay
+    if (is.null(assay) || !nzchar(assay) || !assay %in% Assays(o) || !is_chromatin(o, assay))
+      return(error_plot("No ATAC (ChromatinAssay) in this object."))
+
+    region <- trimws(input$cv_gene %||% "")
+    if (!nzchar(region))
+      return(error_plot("Enter a gene symbol (e.g. Cd4) or a region (chr1-100-200)."))
+    req(input$cv_group)
+
+    # Coverage needs fragment files; this object may reference cluster paths
+    frags   <- tryCatch(Signac::Fragments(o[[assay]]), error = function(e) list())
+    frag_ok <- length(frags) > 0 && any(vapply(frags, function(fr) {
+      p <- tryCatch(Signac::GetFragmentData(fr, "path"), error = function(e) "")
+      is.character(p) && nzchar(p) && file.exists(p)
+    }, logical(1)))
+    if (!frag_ok)
+      return(error_plot(paste0(
+        "ATAC fragment files aren't accessible here, so coverage tracks\n",
+        "can't be computed. The object points to fragments at paths that\n",
+        "don't exist on this machine (e.g. a cluster path).\n\n",
+        "Fix: repoint them with Signac::UpdatePath() to local files, or run\n",
+        "the app where the fragments live.")))
+
+    tryCatch({
+      oc <- o
+      DefaultAssay(oc) <- assay
+      grp <- input$cv_group
+      oc@meta.data[[grp]] <- order_factor(oc@meta.data[[grp]])
+      Idents(oc) <- grp
+      Signac::CoveragePlot(
+        oc, region = region, group.by = grp, assay = assay,
+        extend.upstream   = input$cv_up,
+        extend.downstream = input$cv_down,
+        annotation = TRUE, peaks = isTRUE(input$cv_peaks)
+      )
+    }, error = function(e) error_plot(conditionMessage(e)))
+  })
+
+  output$cv_plot <- renderPlot({ cv_plot_r() })
+  output$cv_dl   <- downloadHandler(
+    filename = function() paste0("coverage_plot.", tolower(input$cv_fmt)),
+    content  = function(file) save_plot(cv_plot_r(), input$cv_fmt, input$cv_w, input$cv_h, file)
   )
 
 

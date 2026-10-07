@@ -16,7 +16,7 @@ Load a Seurat `.RDS` file and explore it through QC, UMAP embeddings, gene expre
 
 | Tab | What it does |
 |---|---|
-| **QC** | `nCount` / `nFeature` / `percent.mt` violins and feature scatter — auto-detected from metadata. |
+| **QC** | `nCount` / `nFeature` / `percent.mt` (plus TSS enrichment and nucleosome signal for ATAC) violins and feature scatter — auto-detected from metadata. |
 | **UMAP / Reduction** | `DimPlot` and `FeaturePlot` on any reduction — clusters, genes, module scores, or 2-gene co-expression. |
 | **Feature Expression** | Violin, box, dot, and heatmap plots for genes and/or module scores, grouped by any metadata column, with optional statistics. |
 | **Spatial** | Clusters, gene expression, or module/UCell scores over tissue images *(shown only when the object has images)*. |
@@ -48,8 +48,21 @@ The interface adapts to each object:
 | scRNA-seq / snRNA-seq | ✅ | ✅ | ✅ | — | ✅ |
 | Standard Visium (spots) | ✅ | ✅ | ✅ | ✅ | ✅ |
 | Visium HD (8 µm / 16 µm bins) | ✅ | ✅ | ✅ | ✅ | ✅ |
+| 10x Multiome (RNA + ATAC) | ✅ | ✅ (incl. WNN) | ✅ | — | ✅ |
 
-If your object has multiple assays (e.g. `Spatial.008um` and `sketch`), switch between them with the **Active Assay** selector in the sidebar.
+If your object has multiple assays (e.g. `Spatial.008um` and `sketch`, or `RNA`, `SCT` and `peaks`), switch between them with the **Active Assay** selector in the sidebar. Each assay is tagged with its modality (*gene expr*, *ATAC / peaks*, …), and the gene/peak search lists refresh when you switch.
+
+---
+
+## Multiome (RNA + ATAC)
+
+SeuratScope recognises Signac `ChromatinAssay` objects:
+
+- **Sensible defaults** — opens on a gene-expression assay (SCT or RNA) and the joint **WNN UMAP**, not on hundreds of thousands of peaks.
+- **ATAC QC** — TSS enrichment, nucleosome signal, FRiP and doublet scores are auto-detected on the QC tab alongside RNA metrics.
+- **Peaks as features** — switch **Active Assay** to your peaks assay to plot individual peaks on UMAPs, violins and heatmaps.
+- **Coverage tab** — genome-browser style `CoveragePlot` tracks for a gene or region, grouped by any metadata column. This needs the original `fragments.tsv.gz` files to be readable at the paths stored in the object. If they aren't (e.g. the object was built on a cluster), the tab explains this instead of failing; repoint them with `Signac::UpdatePath()`.
+- **Signac is optional** — install it with `BiocManager::install("Signac")`; without it everything else still works.
 
 ---
 
